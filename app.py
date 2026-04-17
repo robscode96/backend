@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, jsonify, request, session
-from flask_cors import CORS
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import psycopg2
@@ -19,11 +18,39 @@ import json
 app = Flask(__name__)
 app.secret_key = os.environ['SECRET_KEY']
 
-# Allow requests from the frontend (GitHub Pages or local)
-CORS(app, origins=os.environ.get('ALLOWED_ORIGINS', '*'), supports_credentials=True)
+app.config.update(
+    SESSION_COOKIE_SAMESITE='None',
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+)
 
 GOOGLE_CLIENT_ID = os.environ['GOOGLE_CLIENT_ID']
 DATABASE_URL = os.environ['DATABASE_URL']
+
+_allowed_origins = [
+    o.strip()
+    for o in os.environ.get('ALLOWED_ORIGINS', 'https://robscode96.github.io').split(',')
+    if o.strip()
+]
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    if origin in _allowed_origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    return response
+
+
+@app.before_request
+def handle_options():
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        add_cors_headers(response)
+        return response
 
 
 # ===================== DATABASE =====================
@@ -34,7 +61,6 @@ def get_db():
 
 
 def init_db():
-    """Create tables if they don't exist."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -81,15 +107,9 @@ def init_db():
 # ===================== AUTH =====================
 
 def require_auth(f):
-    """Decorator: reject requests without a valid session.
-    Falls back to ?uid= query param for iOS PWA which drops SameSite=None cookies.
-    The uid is validated against the database so it cannot be spoofed to access
-    another user's data — it only works if the user record actually exists.
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'user_id' not in session:
-            # iOS PWA fallback: accept ?uid= query param
             uid = request.args.get('uid')
             if uid:
                 conn = get_db()
@@ -110,10 +130,6 @@ def require_auth(f):
 
 @app.route('/api/auth/google', methods=['POST'])
 def google_auth():
-    """
-    Receive a Google ID token from the frontend, verify it,
-    create or update the user record, and start a session.
-    """
     data = request.get_json()
     token = data.get('credential')
     if not token:
@@ -135,7 +151,6 @@ def google_auth():
     conn = get_db()
     cur = conn.cursor()
 
-    # Upsert user
     cur.execute("""
         INSERT INTO users (google_id, email, display_name)
         VALUES (%s, %s, %s)
@@ -146,7 +161,6 @@ def google_auth():
     """, (google_id, email, display_name))
     user = cur.fetchone()
 
-    # Create default settings row if first login
     cur.execute("""
         INSERT INTO settings (user_id)
         VALUES (%s)
@@ -178,7 +192,6 @@ def logout():
 @app.route('/api/auth/me', methods=['GET'])
 @require_auth
 def me():
-    """Return current user info — used by frontend on page load to check login state."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT id, email, display_name FROM users WHERE id = %s", (session['user_id'],))
@@ -231,7 +244,6 @@ def get_routes():
 @require_auth
 def create_route():
     data = request.get_json()
-
     earnings = data.get('earnings')
     if not earnings or float(earnings) <= 0:
         return jsonify({'error': 'earnings must be > 0'}), 400
@@ -256,7 +268,6 @@ def create_route():
     conn.commit()
     cur.close()
     conn.close()
-
     return jsonify({'id': str(new_id)}), 201
 
 
@@ -268,14 +279,8 @@ def update_route(route_id):
     cur = conn.cursor()
     cur.execute("""
         UPDATE routes
-        SET date = %s,
-            earnings = %s,
-            miles = %s,
-            start_time = %s,
-            end_time = %s,
-            type = %s,
-            notes = %s,
-            updated_at = NOW()
+        SET date = %s, earnings = %s, miles = %s, start_time = %s,
+            end_time = %s, type = %s, notes = %s, updated_at = NOW()
         WHERE id = %s AND user_id = %s
         RETURNING id
     """, (
@@ -293,7 +298,6 @@ def update_route(route_id):
     conn.commit()
     cur.close()
     conn.close()
-
     if not updated:
         return jsonify({'error': 'Route not found'}), 404
     return jsonify({'ok': True})
@@ -304,14 +308,12 @@ def update_route(route_id):
 def delete_route(route_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM routes WHERE id = %s AND user_id = %s RETURNING id
-    """, (route_id, session['user_id']))
+    cur.execute("DELETE FROM routes WHERE id = %s AND user_id = %s RETURNING id",
+                (route_id, session['user_id']))
     deleted = cur.fetchone()
     conn.commit()
     cur.close()
     conn.close()
-
     if not deleted:
         return jsonify({'error': 'Route not found'}), 404
     return jsonify({'ok': True})
@@ -328,10 +330,8 @@ def get_settings():
     row = cur.fetchone()
     cur.close()
     conn.close()
-
     if not row:
         return jsonify({'error': 'Settings not found'}), 404
-
     return jsonify({
         'weeklyGoal': float(row['weekly_goal']),
         'monthlyGoal': float(row['monthly_goal']),
@@ -350,13 +350,8 @@ def update_settings():
     cur = conn.cursor()
     cur.execute("""
         UPDATE settings
-        SET weekly_goal = %s,
-            monthly_goal = %s,
-            mileage_rate = %s,
-            fed_bracket = %s,
-            state_rate = %s,
-            route_types = %s,
-            updated_at = NOW()
+        SET weekly_goal = %s, monthly_goal = %s, mileage_rate = %s,
+            fed_bracket = %s, state_rate = %s, route_types = %s, updated_at = NOW()
         WHERE user_id = %s
     """, (
         data.get('weeklyGoal', 800),
@@ -373,24 +368,16 @@ def update_settings():
     return jsonify({'ok': True})
 
 
-# ===================== IMPORT (localStorage migration) =====================
+# ===================== IMPORT =====================
 
 @app.route('/api/import', methods=['POST'])
 @require_auth
 def import_routes():
-    """
-    One-time migration endpoint. Accepts the user's localStorage data
-    and bulk-inserts it into the database. Safe to call multiple times
-    (duplicate dates/earnings on same day will still insert — user can
-    delete dupes manually).
-    """
     data = request.get_json()
     routes = data.get('routes', [])
     settings = data.get('settings')
-
     conn = get_db()
     cur = conn.cursor()
-
     imported = 0
     for r in routes:
         try:
@@ -409,14 +396,12 @@ def import_routes():
             ))
             imported += 1
         except Exception:
-            continue  # skip malformed records
-
+            continue
     if settings:
         cur.execute("""
             UPDATE settings
             SET weekly_goal = %s, monthly_goal = %s, mileage_rate = %s,
-                fed_bracket = %s, state_rate = %s, route_types = %s,
-                updated_at = NOW()
+                fed_bracket = %s, state_rate = %s, route_types = %s, updated_at = NOW()
             WHERE user_id = %s
         """, (
             settings.get('weeklyGoal', 800),
@@ -427,11 +412,9 @@ def import_routes():
             json.dumps(settings.get('routeTypes', ['Flex', 'DSP', 'DoorDash', 'Instacart', 'Other'])),
             session['user_id'],
         ))
-
     conn.commit()
     cur.close()
     conn.close()
-
     return jsonify({'imported': imported})
 
 
@@ -439,7 +422,7 @@ def import_routes():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'version': '2.0.0'})
+    return jsonify({'status': 'ok', 'version': '2.0.1'})
 
 
 # ===================== STARTUP =====================
