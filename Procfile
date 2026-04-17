@@ -1,1 +1,1 @@
-web: gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 60 --error-logfile - --access-logfile - app:app
+web: python -c "import app; app.init_db()" && gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 60 --error-logfile - --access-logfile - app:app
