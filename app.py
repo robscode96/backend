@@ -1,19 +1,17 @@
 """
 RouteLog Backend — Phase 2
-Flask + PostgreSQL + Magic Link Auth
+Flask + PostgreSQL + Email/Password Auth
 """
 
 import os
-import secrets
 import hashlib
-from datetime import datetime, timezone, timedelta
+import secrets
 from functools import wraps
 
 from flask import Flask, jsonify, request, session
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
-import requests
 
 app = Flask(__name__)
 app.secret_key = os.environ['SECRET_KEY']
@@ -25,9 +23,6 @@ app.config.update(
 )
 
 DATABASE_URL = os.environ['DATABASE_URL']
-RESEND_API_KEY = os.environ['RESEND_API_KEY']
-FROM_EMAIL = os.environ.get('FROM_EMAIL', 'onboarding@resend.dev')
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://robscode96.github.io/routelog')
 
 _allowed_origins = [
     o.strip()
@@ -62,6 +57,13 @@ def get_db():
     return conn
 
 
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(32)
+    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 260000)
+    return salt, hashed.hex()
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -72,15 +74,8 @@ def init_db():
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             email TEXT UNIQUE NOT NULL,
             display_name TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS magic_links (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            token TEXT UNIQUE NOT NULL,
-            expires_at TIMESTAMPTZ NOT NULL,
-            used BOOLEAN DEFAULT FALSE,
+            password_hash TEXT,
+            password_salt TEXT,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
 
@@ -138,127 +133,83 @@ def require_auth(f):
     return decorated
 
 
-@app.route('/api/auth/request-link', methods=['POST'])
-def request_magic_link():
+@app.route('/api/auth/register', methods=['POST'])
+def register():
     data = request.get_json()
     email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    display_name = data.get('displayName', '').strip() or email.split('@')[0]
+
     if not email or '@' not in email:
         return jsonify({'error': 'Valid email required'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+
+    salt, hashed = hash_password(password)
 
     conn = get_db()
     cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (email, display_name, password_hash, password_salt)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, email, display_name
+        """, (email, display_name, hashed, salt))
+        user = cur.fetchone()
+        cur.execute("INSERT INTO settings (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (str(user['id']),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        if 'unique' in str(e).lower():
+            return jsonify({'error': 'An account with this email already exists'}), 409
+        return jsonify({'error': 'Registration failed'}), 500
 
-    # Create user if they don't exist
-    cur.execute("""
-        INSERT INTO users (email, display_name)
-        VALUES (%s, %s)
-        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-        RETURNING id, email, display_name
-    """, (email, email.split('@')[0]))
-    user = cur.fetchone()
-
-    # Create default settings if first time
-    cur.execute("""
-        INSERT INTO settings (user_id)
-        VALUES (%s)
-        ON CONFLICT (user_id) DO NOTHING
-    """, (str(user['id']),))
-
-    # Generate magic link token
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
-
-    cur.execute("""
-        INSERT INTO magic_links (user_id, token, expires_at)
-        VALUES (%s, %s, %s)
-    """, (str(user['id']), token, expires_at))
-
-    conn.commit()
     cur.close()
     conn.close()
 
-    # Send email via Resend
-    magic_url = f"{FRONTEND_URL}?token={token}"
-    
-    resp = requests.post(
-        'https://api.resend.com/emails',
-        headers={
-            'Authorization': f'Bearer {RESEND_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        json={
-            'from': FROM_EMAIL,
-            'to': email,
-            'subject': 'Sign in to RouteLog',
-            'html': f'''
-                <div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:40px 20px;">
-                    <h2 style="color:#00e5a0;font-family:monospace;">RouteLog</h2>
-                    <p>Tap the button below to sign in. This link expires in 15 minutes.</p>
-                    <a href="{magic_url}" style="display:inline-block;background:#00e5a0;color:#0d0f14;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;margin:16px 0;">
-                        Sign in to RouteLog
-                    </a>
-                    <p style="color:#888;font-size:13px;">If you didn't request this, ignore this email.</p>
-                </div>
-            '''
-        }
-    )
-
-    if resp.status_code not in (200, 201):
-        return jsonify({'error': 'Failed to send email'}), 500
-
-    return jsonify({'ok': True})
-
-
-@app.route('/api/auth/verify-token', methods=['POST'])
-def verify_magic_token():
-    data = request.get_json()
-    token = data.get('token', '').strip()
-    if not token:
-        return jsonify({'error': 'Token required'}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT ml.id, ml.user_id, ml.expires_at, ml.used,
-               u.email, u.display_name
-        FROM magic_links ml
-        JOIN users u ON u.id = ml.user_id
-        WHERE ml.token = %s
-    """, (token,))
-    link = cur.fetchone()
-
-    if not link:
-        cur.close()
-        conn.close()
-        return jsonify({'error': 'Invalid link'}), 401
-
-    if link['used']:
-        cur.close()
-        conn.close()
-        return jsonify({'error': 'Link already used'}), 401
-
-    if link['expires_at'] < datetime.now(timezone.utc):
-        cur.close()
-        conn.close()
-        return jsonify({'error': 'Link expired'}), 401
-
-    # Mark token as used
-    cur.execute("UPDATE magic_links SET used = TRUE WHERE id = %s", (str(link['id']),))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    session['user_id'] = str(link['user_id'])
+    session['user_id'] = str(user['id'])
     session.permanent = True
 
-    return jsonify({
-        'user': {
-            'id': str(link['user_id']),
-            'email': link['email'],
-            'display_name': link['display_name'] or link['email'],
-        }
-    })
+    return jsonify({'user': {
+        'id': str(user['id']),
+        'email': user['email'],
+        'display_name': user['display_name'],
+    }}), 201
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email, display_name, password_hash, password_salt FROM users WHERE email = %s", (email,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user or not user['password_hash']:
+        return jsonify({'error': 'Invalid email or password'}), 401
+
+    _, hashed = hash_password(password, user['password_salt'])
+    if hashed != user['password_hash']:
+        return jsonify({'error': 'Invalid email or password'}), 401
+
+    session['user_id'] = str(user['id'])
+    session.permanent = True
+
+    return jsonify({'user': {
+        'id': str(user['id']),
+        'email': user['email'],
+        'display_name': user['display_name'],
+    }})
 
 
 @app.route('/api/auth/logout', methods=['POST'])
@@ -476,7 +427,7 @@ def import_routes():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'version': '2.1.0'})
+    return jsonify({'status': 'ok', 'version': '2.2.0'})
 
 
 # ===================== STARTUP =====================
